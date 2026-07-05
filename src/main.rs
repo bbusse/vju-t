@@ -667,6 +667,117 @@ fn status_with_text_label(status: u64, append_text: Option<&str>) -> String {
     }
 }
 
+fn static_icon_mask_for_token(token: &str) -> Option<&'static [&'static str]> {
+    // A compact, modern key silhouette. '#' are filled pixels, '.' are empty.
+    const KEY_ICON_MASK: &[&str] = &[
+        ".....######..............",
+        "...###....###............",
+        "..##..##....##...........",
+        "..##..##....############.",
+        "..##........##....##..##.",
+        "...###....###.....######.",
+        ".....######........##....",
+    ];
+
+    if token.eq_ignore_ascii_case("KEY_ICON") || token.eq_ignore_ascii_case("KEY") {
+        Some(KEY_ICON_MASK)
+    } else {
+        None
+    }
+}
+
+fn render_scaled_icon_lines(mask: &[&str], max_w: u16, max_h: u16) -> Vec<String> {
+    if max_w == 0 || max_h == 0 || mask.is_empty() {
+        return Vec::new();
+    }
+
+    // Normalize the mask to its filled bounding box so icon tokens stay centered
+    // even if their masks include uneven left/right padding.
+    let mask_chars: Vec<Vec<char>> = mask.iter().map(|row| row.chars().collect()).collect();
+    let mut min_col = usize::MAX;
+    let mut max_col = 0usize;
+    for row in &mask_chars {
+        for (idx, ch) in row.iter().enumerate() {
+            if *ch != '.' && *ch != ' ' {
+                min_col = min_col.min(idx);
+                max_col = max_col.max(idx);
+            }
+        }
+    }
+    if min_col == usize::MAX {
+        return Vec::new();
+    }
+
+    let trimmed_mask: Vec<String> = mask_chars
+        .iter()
+        .map(|row| {
+            let end = max_col.min(row.len().saturating_sub(1));
+            row[min_col..=end].iter().collect::<String>()
+        })
+        .collect();
+
+    let base_h = trimmed_mask.len() as u16;
+    let base_w = trimmed_mask.iter().map(|row| row.chars().count() as u16).max().unwrap_or(1);
+    if base_w == 0 || base_h == 0 {
+        return Vec::new();
+    }
+
+    let scale_x = (max_w / base_w).max(1);
+    let scale_y = (max_h / base_h).max(1);
+    let scale = scale_x.min(scale_y).max(1) as usize;
+
+    let mut out: Vec<String> = Vec::new();
+    for row in &trimmed_mask {
+        let mut expanded_row = String::new();
+        for ch in row.chars() {
+            let pixel = match ch {
+                '#' => '█',
+                '+' => '▓',
+                '=' => '▒',
+                '.' | ' ' => ' ',
+                _ => ch,
+            };
+            for _ in 0..scale {
+                expanded_row.push(pixel);
+            }
+        }
+        for _ in 0..scale {
+            out.push(expanded_row.clone());
+        }
+    }
+    out
+}
+
+/// Combine pairs of full-block rows into a single row of half-block characters.
+/// Each output row represents two input rows using ▀ (upper), ▄ (lower),
+/// █ (both), or ' ' (neither), halving the visual height like PixelSize::HalfHeight.
+fn render_half_height_pass(rows: Vec<String>) -> Vec<String> {
+    let to_cells = |row: &str| -> Vec<bool> {
+        row.chars().map(|c| c != ' ').collect()
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let top = to_cells(&rows[i]);
+        let bot = if i + 1 < rows.len() { to_cells(&rows[i + 1]) } else { vec![] };
+        let width = top.len().max(bot.len());
+        let mut combined = String::new();
+        for col in 0..width {
+            let t = top.get(col).copied().unwrap_or(false);
+            let b = bot.get(col).copied().unwrap_or(false);
+            combined.push(match (t, b) {
+                (true,  true)  => '█',
+                (true,  false) => '▀',
+                (false, true)  => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push(combined);
+        i += 2;
+    }
+    out
+}
+
 fn push_output_line(
     line: &str,
     buffer: &Arc<Mutex<Vec<(u64, String)>>>,
@@ -880,6 +991,7 @@ struct CliArgs {
     title_override: Option<String>,
     append_text: Option<String>,
     status_rect_static_text: Option<String>,
+    status_rect_static_icon: Option<String>,
     description: Option<String>,
     border_colour: Color,
     title_colour: Color,
@@ -896,6 +1008,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
     let mut title_override: Option<String> = None;
     let mut append_text: Option<String> = None;
     let mut status_rect_static_text: Option<String> = None;
+    let mut status_rect_static_icon: Option<String> = None;
     let mut description: Option<String> = None;
     let mut border_colour: Color = theme::Colors::BORDER_COLOUR;
     let mut title_colour: Color = theme::Colors::TITLE_COLOUR;
@@ -943,6 +1056,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             "--status-rect-with-text" => {
                 render_mode = RenderMode::StatusRectWithText;
                 status_rect_static_text = None;
+                status_rect_static_icon = None;
                 i += 1;
             }
             "--status-rect-with-static-text" => {
@@ -951,6 +1065,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                     std::process::exit(1);
                 }
                 status_rect_static_text = Some(args[i + 1].clone());
+                status_rect_static_icon = None;
                 render_mode = RenderMode::StatusRectWithText;
                 i += 2;
             }
@@ -961,6 +1076,28 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                     std::process::exit(1);
                 }
                 status_rect_static_text = Some(value.to_string());
+                status_rect_static_icon = None;
+                render_mode = RenderMode::StatusRectWithText;
+                i += 1;
+            }
+            "--status-rect-with-static-icon" => {
+                if i + 1 >= parse_end {
+                    eprintln!("Error: --status-rect-with-static-icon requires a value");
+                    std::process::exit(1);
+                }
+                status_rect_static_icon = Some(args[i + 1].clone());
+                status_rect_static_text = None;
+                render_mode = RenderMode::StatusRectWithText;
+                i += 2;
+            }
+            _ if args[i].starts_with("--status-rect-with-static-icon=") => {
+                let value = args[i].split_once('=').map(|(_, v)| v).unwrap_or("");
+                if value.is_empty() {
+                    eprintln!("Error: --status-rect-with-static-icon requires a non-empty value");
+                    std::process::exit(1);
+                }
+                status_rect_static_icon = Some(value.to_string());
+                status_rect_static_text = None;
                 render_mode = RenderMode::StatusRectWithText;
                 i += 1;
             }
@@ -1152,6 +1289,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("  --status-circle-with-text     Circle with text overlay");
                 println!("  --status-rect-with-text       Rectangle with big-text value");
                 println!("  --status-rect-with-static-text <text>  Rectangle with static text overlay");
+                println!("  --status-rect-with-static-icon <icon>  Rectangle with built-in static icon (e.g. KEY_ICON)");
                 println!("  --append-text <text>          Append suffix after big-text value (e.g. 's', 'ms')");
                 println!("  --watch [<duration>]          Re-run command periodically (default: 60s)");
                 println!("  --title <text>                Set pane title");
@@ -1190,6 +1328,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
         title_override,
         append_text,
         status_rect_static_text,
+        status_rect_static_icon,
         description,
         border_colour,
         title_colour,
@@ -1217,6 +1356,7 @@ fn main() -> anyhow::Result<()> {
     let watch_ms = cli.watch_ms;
     let append_text = cli.append_text;
     let status_rect_static_text = cli.status_rect_static_text;
+    let status_rect_static_icon = cli.status_rect_static_icon;
     let description = cli.description;
     let border_colour = cli.border_colour;
     let title_colour = cli.title_colour;
@@ -1225,7 +1365,7 @@ fn main() -> anyhow::Result<()> {
     let script_args = cli.script_args;
 
     if script_args.is_empty() && std::io::stdin().is_terminal() {
-        eprintln!("Usage: vju-t [--no-frame] [--pie-chart|--bar-chart|--line-chart|--status-circle|--status-rect|--status-circle-with-text|--status-rect-with-text|--status-rect-with-static-text <text>|--big-text] [--watch <duration>] [--title <text>] [--] <script> [arguments...]");
+        eprintln!("Usage: vju-t [--no-frame] [--pie-chart|--bar-chart|--line-chart|--status-circle|--status-rect|--status-circle-with-text|--status-rect-with-text|--status-rect-with-static-text <text>|--status-rect-with-static-icon <icon>|--big-text] [--watch <duration>] [--title <text>] [--] <script> [arguments...]");
         eprintln!("  duration: number with unit, e.g. 60ms, 5s, 2m, 1h, 1d");
         eprintln!("  or pipe input: echo '10 20 30' | vju-t --line-chart");
         std::process::exit(1);
@@ -1754,34 +1894,69 @@ fn main() -> anyhow::Result<()> {
                                 .centered();
                                 f.render_widget(waiting, inner);
                             } else {
-                                let display_str = match status_rect_static_text.as_deref() {
-                                    Some(static_text) => static_text.to_string(),
-                                    None => status_with_text_label(status, append_text.as_deref()),
-                                };
-                                let big_lines: Vec<Line<'static>> = vec![Line::raw(display_str)];
+                                let text_style = Style::default()
+                                    .fg(status_text_color(status, status_good_colour, status_bad_colour))
+                                    .add_modifier(Modifier::BOLD);
 
-                                let area = inner;
-                                let line_count = big_lines.len() as u16;
-                                let max_chars = big_lines.iter()
-                                    .map(|l| l.width() as u16)
-                                    .max()
-                                    .unwrap_or(1);
-                                let needed_h = (line_count * 4).min(area.height);
-                                let needed_w = (max_chars * 8).min(area.width);
-                                let centered = Rect::new(
-                                    area.x + area.width.saturating_sub(needed_w) / 2,
-                                    area.y + area.height.saturating_sub(needed_h) / 2,
-                                    needed_w,
-                                    needed_h,
-                                );
+                                if let Some(icon_mask) = status_rect_static_icon
+                                    .as_deref()
+                                    .and_then(static_icon_mask_for_token)
+                                {
+                                    // Scale into twice the vertical budget, then halve with
+                                    // half-block characters — same as PixelSize::HalfHeight.
+                                    let raw = render_scaled_icon_lines(icon_mask, inner.width, inner.height.saturating_mul(2));
+                                    let icon_lines = render_half_height_pass(raw);
+                                    let icon_w = icon_lines
+                                        .iter()
+                                        .map(|l| l.chars().count() as u16)
+                                        .max()
+                                        .unwrap_or(1)
+                                        .min(inner.width);
+                                    let icon_h = (icon_lines.len() as u16).min(inner.height);
+                                    let icon_area = Rect::new(
+                                        inner.x + inner.width.saturating_sub(icon_w) / 2,
+                                        inner.y + inner.height.saturating_sub(icon_h) / 2,
+                                        icon_w,
+                                        icon_h,
+                                    );
+                                    let lines: Vec<Line<'static>> = icon_lines
+                                        .iter()
+                                        .map(|l| Line::styled((*l).to_string(), text_style))
+                                        .collect();
+                                    let icon = Paragraph::new(lines)
+                                        .alignment(Alignment::Center)
+                                        .wrap(Wrap { trim: false });
+                                    f.render_widget(icon, icon_area);
+                                } else {
+                                    let display_str = match status_rect_static_text.as_deref() {
+                                        Some(static_text) => static_text.to_string(),
+                                        None => status_with_text_label(status, append_text.as_deref()),
+                                    };
+                                    let big_lines: Vec<Line<'static>> = vec![Line::raw(display_str)];
 
-                                let big_text = BigText::builder()
-                                    .pixel_size(PixelSize::HalfHeight)
-                                    .centered()
-                                    .style(Style::default().fg(status_text_color(status, status_good_colour, status_bad_colour)).add_modifier(Modifier::BOLD))
-                                    .lines(big_lines)
-                                    .build();
-                                f.render_widget(big_text, centered);
+                                    let area = inner;
+                                    let line_count = big_lines.len() as u16;
+                                    let max_chars = big_lines.iter()
+                                        .map(|l| l.width() as u16)
+                                        .max()
+                                        .unwrap_or(1);
+                                    let needed_h = (line_count * 4).min(area.height);
+                                    let needed_w = (max_chars * 8).min(area.width);
+                                    let centered = Rect::new(
+                                        area.x + area.width.saturating_sub(needed_w) / 2,
+                                        area.y + area.height.saturating_sub(needed_h) / 2,
+                                        needed_w,
+                                        needed_h,
+                                    );
+
+                                    let big_text = BigText::builder()
+                                        .pixel_size(PixelSize::HalfHeight)
+                                        .centered()
+                                        .style(text_style)
+                                        .lines(big_lines)
+                                        .build();
+                                    f.render_widget(big_text, centered);
+                                }
                             }
                         } else {
                             let help = Paragraph::new(
