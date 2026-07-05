@@ -873,6 +873,7 @@ fn read_stdin_once(
 
 struct CliArgs {
     frame: bool,
+    select_mode: bool,
     render_mode: RenderMode,
     watch_ms: Option<u64>,
     title_override: Option<String>,
@@ -887,6 +888,7 @@ struct CliArgs {
 
 fn parse_cli_args(args: &[String]) -> CliArgs {
     let mut frame = true;
+    let mut select_mode = false;
     let mut render_mode = RenderMode::Text;
     let mut watch_ms: Option<u64> = None;
     let mut title_override: Option<String> = None;
@@ -905,6 +907,10 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
         match args[i].as_str() {
             "--no-frame" => {
                 frame = false;
+                i += 1;
+            }
+            "--select" => {
+                select_mode = true;
                 i += 1;
             }
             "--pie-chart" => {
@@ -1113,6 +1119,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("Usage: vju-t [OPTIONS] [--] <command> [arguments...]\n");
                 println!("Options:");
                 println!("  --no-frame                    Disable border frame");
+                println!("  --select                      Enable output line selection in text mode");
                 println!("  --big-text                    Render output as large text");
                 println!("  --pie-chart                   Render output as pie chart");
                 println!("  --bar-chart                   Render output as bar chart");
@@ -1135,6 +1142,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("  q       Quit");
                 println!("  v       Toggle info overlay");
                 println!("  r       Re-run command");
+                println!("  Up/Down Cycle selection (with --select)");
                 println!("  Up/Down Scroll output");
                 println!("  End     Resume auto-scroll");
                 std::process::exit(0);
@@ -1152,6 +1160,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
 
     CliArgs {
         frame,
+        select_mode,
         render_mode,
         watch_ms,
         title_override,
@@ -1178,6 +1187,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let cli = parse_cli_args(&args);
     let frame = cli.frame;
+    let select_mode = cli.select_mode;
     let render_mode = cli.render_mode;
     let watch_ms = cli.watch_ms;
     let append_text = cli.append_text;
@@ -1264,6 +1274,7 @@ fn main() -> anyhow::Result<()> {
     let mut scroll_offset: u16 = 0;
     let mut auto_scroll = true;
     let mut max_scroll: u16 = 0;
+    let mut selected_index: Option<usize> = None;
     let mut show_info = false;
 
     loop {
@@ -1357,6 +1368,19 @@ fn main() -> anyhow::Result<()> {
                         let styled_lines: Vec<Line<'static>> = raw_lines.iter()
                             .map(|l| ansi_to_line(l))
                             .collect();
+                        let mut styled_lines = styled_lines;
+
+                        if select_mode && !styled_lines.is_empty() && selected_index.is_some() {
+                            let idx = selected_index.unwrap_or(0).min(styled_lines.len() - 1);
+                            if let Some(line) = styled_lines.get_mut(idx) {
+                                for span in &mut line.spans {
+                                    span.style = span
+                                        .style
+                                        .patch(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                                }
+                            }
+                        }
+
                         let paragraph = Paragraph::new(styled_lines)
                             .block(block)
                             .scroll((scroll, 0));
@@ -1818,19 +1842,59 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     KeyCode::Up => {
-                        if auto_scroll {
-                            scroll_offset = max_scroll;
+                        if select_mode && matches!(render_mode, RenderMode::Text) {
+                            let line_count = {
+                                let buf = buffer.lock().unwrap();
+                                let current_run = active_run.load(Ordering::SeqCst);
+                                display_lines_for_run(&buf, current_run).len()
+                            };
+                            if line_count > 0 {
+                                auto_scroll = false;
+                                let next = match selected_index {
+                                    Some(current) => {
+                                        let current = current.min(line_count - 1);
+                                        if current == 0 { line_count - 1 } else { current - 1 }
+                                    }
+                                    None => line_count - 1,
+                                };
+                                selected_index = Some(next);
+                                scroll_offset = (next as u16).min(max_scroll);
+                            }
+                        } else {
+                            if auto_scroll {
+                                scroll_offset = max_scroll;
+                            }
+                            auto_scroll = false;
+                            scroll_offset = scroll_offset.saturating_sub(1);
                         }
-                        auto_scroll = false;
-                        scroll_offset = scroll_offset.saturating_sub(1);
                         needs_redraw = true;
                     }
                     KeyCode::Down => {
-                        if auto_scroll {
-                            scroll_offset = max_scroll;
+                        if select_mode && matches!(render_mode, RenderMode::Text) {
+                            let line_count = {
+                                let buf = buffer.lock().unwrap();
+                                let current_run = active_run.load(Ordering::SeqCst);
+                                display_lines_for_run(&buf, current_run).len()
+                            };
+                            if line_count > 0 {
+                                auto_scroll = false;
+                                let next = match selected_index {
+                                    Some(current) => {
+                                        let current = current.min(line_count - 1);
+                                        if current + 1 >= line_count { 0 } else { current + 1 }
+                                    }
+                                    None => 0,
+                                };
+                                selected_index = Some(next);
+                                scroll_offset = (next as u16).min(max_scroll);
+                            }
+                        } else {
+                            if auto_scroll {
+                                scroll_offset = max_scroll;
+                            }
+                            auto_scroll = false;
+                            scroll_offset = scroll_offset.saturating_add(1);
                         }
-                        auto_scroll = false;
-                        scroll_offset = scroll_offset.saturating_add(1);
                         needs_redraw = true;
                     }
                     KeyCode::PageUp => {
@@ -1852,6 +1916,13 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::End => {
                         auto_scroll = true;
                         needs_redraw = true;
+                    }
+                    KeyCode::Esc => {
+                        if select_mode && matches!(render_mode, RenderMode::Text) {
+                            selected_index = None;
+                            auto_scroll = true;
+                            needs_redraw = true;
+                        }
                     }
 
                     // Re-run script on 'r'
