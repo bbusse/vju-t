@@ -879,6 +879,7 @@ struct CliArgs {
     watch_ms: Option<u64>,
     title_override: Option<String>,
     append_text: Option<String>,
+    status_rect_static_text: Option<String>,
     description: Option<String>,
     border_colour: Color,
     title_colour: Color,
@@ -894,6 +895,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
     let mut watch_ms: Option<u64> = None;
     let mut title_override: Option<String> = None;
     let mut append_text: Option<String> = None;
+    let mut status_rect_static_text: Option<String> = None;
     let mut description: Option<String> = None;
     let mut border_colour: Color = theme::Colors::BORDER_COLOUR;
     let mut title_colour: Color = theme::Colors::TITLE_COLOUR;
@@ -939,6 +941,26 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 i += 1;
             }
             "--status-rect-with-text" => {
+                render_mode = RenderMode::StatusRectWithText;
+                status_rect_static_text = None;
+                i += 1;
+            }
+            "--status-rect-with-static-text" => {
+                if i + 1 >= parse_end {
+                    eprintln!("Error: --status-rect-with-static-text requires a value");
+                    std::process::exit(1);
+                }
+                status_rect_static_text = Some(args[i + 1].clone());
+                render_mode = RenderMode::StatusRectWithText;
+                i += 2;
+            }
+            _ if args[i].starts_with("--status-rect-with-static-text=") => {
+                let value = args[i].split_once('=').map(|(_, v)| v).unwrap_or("");
+                if value.is_empty() {
+                    eprintln!("Error: --status-rect-with-static-text requires a non-empty value");
+                    std::process::exit(1);
+                }
+                status_rect_static_text = Some(value.to_string());
                 render_mode = RenderMode::StatusRectWithText;
                 i += 1;
             }
@@ -1129,6 +1151,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("  --status-rect                 Render status as rectangle");
                 println!("  --status-circle-with-text     Circle with text overlay");
                 println!("  --status-rect-with-text       Rectangle with big-text value");
+                println!("  --status-rect-with-static-text <text>  Rectangle with static text overlay");
                 println!("  --append-text <text>          Append suffix after big-text value (e.g. 's', 'ms')");
                 println!("  --watch [<duration>]          Re-run command periodically (default: 60s)");
                 println!("  --title <text>                Set pane title");
@@ -1166,6 +1189,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
         watch_ms,
         title_override,
         append_text,
+        status_rect_static_text,
         description,
         border_colour,
         title_colour,
@@ -1192,6 +1216,7 @@ fn main() -> anyhow::Result<()> {
     let render_mode = cli.render_mode;
     let watch_ms = cli.watch_ms;
     let append_text = cli.append_text;
+    let status_rect_static_text = cli.status_rect_static_text;
     let description = cli.description;
     let border_colour = cli.border_colour;
     let title_colour = cli.title_colour;
@@ -1200,7 +1225,7 @@ fn main() -> anyhow::Result<()> {
     let script_args = cli.script_args;
 
     if script_args.is_empty() && std::io::stdin().is_terminal() {
-        eprintln!("Usage: vju-t [--no-frame] [--pie-chart|--bar-chart|--line-chart|--status-circle|--status-rect|--status-circle-with-text|--status-rect-with-text|--big-text] [--watch <duration>] [--title <text>] [--] <script> [arguments...]");
+        eprintln!("Usage: vju-t [--no-frame] [--pie-chart|--bar-chart|--line-chart|--status-circle|--status-rect|--status-circle-with-text|--status-rect-with-text|--status-rect-with-static-text <text>|--big-text] [--watch <duration>] [--title <text>] [--] <script> [arguments...]");
         eprintln!("  duration: number with unit, e.g. 60ms, 5s, 2m, 1h, 1d");
         eprintln!("  or pipe input: echo '10 20 30' | vju-t --line-chart");
         std::process::exit(1);
@@ -1729,7 +1754,10 @@ fn main() -> anyhow::Result<()> {
                                 .centered();
                                 f.render_widget(waiting, inner);
                             } else {
-                                let display_str = status_with_text_label(status, append_text.as_deref());
+                                let display_str = match status_rect_static_text.as_deref() {
+                                    Some(static_text) => static_text.to_string(),
+                                    None => status_with_text_label(status, append_text.as_deref()),
+                                };
                                 let big_lines: Vec<Line<'static>> = vec![Line::raw(display_str)];
 
                                 let area = inner;
