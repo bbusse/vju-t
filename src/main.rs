@@ -35,6 +35,7 @@ mod theme {
         pub const COLOUR_GOOD_0: Color = Color::Rgb(0, 163, 224);
         pub const COLOUR_WARN_0: Color = Color::Rgb(245, 158, 11);
         pub const COLOUR_BAD_0: Color = Color::Rgb(224, 70, 90);
+        pub const SELECTION_BG: Color = Self::COLOUR_GOOD_0;
         pub const BORDER_COLOUR: Color = Color::White;
         pub const TITLE_COLOUR: Color = Color::White;
     }
@@ -1376,7 +1377,7 @@ fn main() -> anyhow::Result<()> {
                                 for span in &mut line.spans {
                                     span.style = span
                                         .style
-                                        .patch(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                                        .patch(Style::default().bg(theme::Colors::SELECTION_BG).add_modifier(Modifier::BOLD));
                                 }
                             }
                         }
