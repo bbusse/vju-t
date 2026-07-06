@@ -992,6 +992,7 @@ struct CliArgs {
     append_text: Option<String>,
     status_rect_static_text: Option<String>,
     status_rect_static_icon: Option<String>,
+    status_rect_conditional_cmd: Option<String>,
     description: Option<String>,
     border_colour: Color,
     title_colour: Color,
@@ -1009,6 +1010,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
     let mut append_text: Option<String> = None;
     let mut status_rect_static_text: Option<String> = None;
     let mut status_rect_static_icon: Option<String> = None;
+    let mut status_rect_conditional_cmd: Option<String> = None;
     let mut description: Option<String> = None;
     let mut border_colour: Color = theme::Colors::BORDER_COLOUR;
     let mut title_colour: Color = theme::Colors::TITLE_COLOUR;
@@ -1098,6 +1100,25 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 }
                 status_rect_static_icon = Some(value.to_string());
                 status_rect_static_text = None;
+                render_mode = RenderMode::StatusRectWithText;
+                i += 1;
+            }
+            "--status-rect-with-conditional-command" => {
+                if i + 1 >= parse_end {
+                    eprintln!("Error: --status-rect-with-conditional-command requires a value");
+                    std::process::exit(1);
+                }
+                status_rect_conditional_cmd = Some(args[i + 1].clone());
+                render_mode = RenderMode::StatusRectWithText;
+                i += 2;
+            }
+            _ if args[i].starts_with("--status-rect-with-conditional-command=") => {
+                let value = args[i].split_once('=').map(|(_, v)| v).unwrap_or("");
+                if value.is_empty() {
+                    eprintln!("Error: --status-rect-with-conditional-command requires a non-empty value");
+                    std::process::exit(1);
+                }
+                status_rect_conditional_cmd = Some(value.to_string());
                 render_mode = RenderMode::StatusRectWithText;
                 i += 1;
             }
@@ -1290,6 +1311,8 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("  --status-rect-with-text       Rectangle with big-text value");
                 println!("  --status-rect-with-static-text <text>  Rectangle with static text overlay");
                 println!("  --status-rect-with-static-icon <icon>  Rectangle with built-in static icon (e.g. KEY_ICON)");
+                println!("  --status-rect-with-conditional-command <cmd>  Rectangle: run <cmd> on success and show its output instead of 'OK'");
+                println!("      Tip: use 'zsh -i -c \"shell-fn args\"' to access shell functions");
                 println!("  --append-text <text>          Append suffix after big-text value (e.g. 's', 'ms')");
                 println!("  --watch [<duration>]          Re-run command periodically (default: 60s)");
                 println!("  --title <text>                Set pane title");
@@ -1329,6 +1352,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
         append_text,
         status_rect_static_text,
         status_rect_static_icon,
+        status_rect_conditional_cmd,
         description,
         border_colour,
         title_colour,
@@ -1357,6 +1381,7 @@ fn main() -> anyhow::Result<()> {
     let append_text = cli.append_text;
     let status_rect_static_text = cli.status_rect_static_text;
     let status_rect_static_icon = cli.status_rect_static_icon;
+    let status_rect_conditional_cmd = cli.status_rect_conditional_cmd;
     let description = cli.description;
     let border_colour = cli.border_colour;
     let title_colour = cli.title_colour;
@@ -1394,6 +1419,9 @@ fn main() -> anyhow::Result<()> {
     let active_run = Arc::new(AtomicU64::new(1));
     let (update_tx, update_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<u64>();
+
+    // Result of the conditional command run (shown instead of "OK" when healthy)
+    let conditional_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Run once at startup: either command output or piped stdin.
     if stdin_mode {
@@ -1930,6 +1958,10 @@ fn main() -> anyhow::Result<()> {
                                 } else {
                                     let display_str = match status_rect_static_text.as_deref() {
                                         Some(static_text) => static_text.to_string(),
+                                        None if status == 0 && status_rect_conditional_cmd.is_some() => {
+                                            conditional_text.lock().unwrap().clone()
+                                                .unwrap_or_else(|| "...".to_string())
+                                        }
                                         None => status_with_text_label(status, append_text.as_deref()),
                                     };
                                     let big_lines: Vec<Line<'static>> = vec![Line::raw(display_str)];
@@ -2169,6 +2201,50 @@ fn main() -> anyhow::Result<()> {
         for finished_run in done_rx.try_iter() {
             if running_run == Some(finished_run) {
                 running_run = None;
+            }
+            // When the primary command finishes, run the conditional command if
+            // health succeeded, or clear the stale result if it failed.
+            if let Some(ref cond_cmd) = status_rect_conditional_cmd {
+                let raw = {
+                    let buf = buffer.lock().unwrap();
+                    display_lines_for_run(&buf, finished_run)
+                };
+                let last_text = raw.iter().rev()
+                    .find(|l| !strip_ansi(l).trim().is_empty())
+                    .map(|l| strip_ansi(l).trim().to_string())
+                    .unwrap_or_default();
+                if parse_status_value(&last_text) == Some(0) {
+                    let cmd = cond_cmd.clone();
+                    let ct = Arc::clone(&conditional_text);
+                    let utx = update_tx.clone();
+                    thread::spawn(move || {
+                        // Use zsh -i so .zshrc is sourced and shell functions
+                        // (e.g. from k8sh) are available without extra wrapping.
+                        let shell = std::env::var("SHELL").unwrap_or_else(|_| "zsh".to_string());
+                        let result = std::process::Command::new(&shell)
+                            .arg("-i")
+                            .arg("-c")
+                            .arg(&cmd)
+                            .output()
+                            .ok()
+                            .and_then(|o| {
+                                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                                // Strip ANSI/OSC sequences (e.g. iTerm2 shell integration
+                                // injects \e]1337;RemoteHost=... into stdout when zsh -i
+                                // sources .zshrc).
+                                let s = strip_ansi(&raw);
+                                s.lines()
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty())
+                                    .last()
+                                    .map(String::from)
+                            });
+                        *ct.lock().unwrap() = result;
+                        let _ = utx.send(());
+                    });
+                } else {
+                    *conditional_text.lock().unwrap() = None;
+                }
             }
         }
 
