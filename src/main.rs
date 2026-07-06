@@ -1295,6 +1295,27 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 };
                 i += 1;
             }
+            "--version" | "-V" => {
+                let version = match std::process::Command::new("git")
+                    .args(["describe", "--exact-match", "HEAD"])
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {
+                        String::from_utf8_lossy(&out.stdout).trim().to_string()
+                    }
+                    _ => std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_else(|| include_str!("../VERSION").trim().to_string()),
+                };
+                println!("{}", version);
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!("vju-t - the versatile terminal widget\n");
                 println!("Usage: vju-t [OPTIONS] [--] <command> [arguments...]\n");
@@ -1321,6 +1342,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("  --title-colour <colour>       Title colour");
                 println!("  --status-colour-good <colour> Status color for healthy (exit 0)");
                 println!("  --status-colour-bad <colour>  Status color for unhealthy (!=0)");
+                println!("  -V, --version                 Print version");
                 println!("  -h, --help                    Show this help\n");
                 println!("Duration units: ms, s, m, h, d (e.g. 500ms, 5s, 2m)\n");
                 println!("Keys:");
