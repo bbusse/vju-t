@@ -40,7 +40,10 @@ vju-t [OPTIONS] <command> [arguments...]
 --status-rect                 Render status as rectangle
 --status-circle-with-text     Circle with text overlay
 --status-rect-with-text       Rectangle with text overlay
+--status-rect-with-static-text <text>  Rectangle with static text overlay
+--status-rect-with-static-icon <icon>  Rectangle with built-in static icon (e.g. KEY_ICON)
 --watch [<duration>]          Re-run command periodically (default: 60s)
+--select                      Enable output line selection (text mode)
 --title <text>                Set pane title
 --description <text>          Description shown in info overlay (v)
 --border-colour <colour>      Border colour (e.g. #ff0000, cyan)
@@ -55,7 +58,7 @@ Duration units: `ms`, `s`, `m`, `h`, `d`
 q         Quit
 v         Toggle info overlay
 r         Re-run command
-Up/Down   Scroll output
+Up/Down   Scroll output (or cycle selection with --select)
 PgUp/PgDn Scroll by page
 End       Resume auto-scroll
 ```
