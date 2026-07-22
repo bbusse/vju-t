@@ -1,7 +1,17 @@
+BIN=target/release/vju-t
 HASH   := $(shell git rev-parse --short HEAD)
 REMOTE ?= gh
 
-.PHONY: release release-candidate rc _check-remote
+all: build strip
+
+build:
+	cargo build --release
+
+strip:
+	strip $(BIN)
+
+clean:
+	cargo clean
 
 _check-remote:
 	@git remote get-url $(REMOTE) > /dev/null 2>&1 || \
@@ -22,3 +32,5 @@ release-candidate rc: _check-remote
 	@printf 'Push tag to trigger a release candidate? [y/N] ' && read ans && \
 	    case "$$ans" in [yY]) git push $(REMOTE) $(TAG) ;; \
 	    *) git tag -d $(TAG); echo 'Aborted — tag removed.' ;; esac
+
+.PHONY: all build strip clean release release-candidate rc _check-remote
