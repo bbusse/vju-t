@@ -13,3 +13,4 @@ jobs:
     with:
       binary_name: vju-t
       artifact_name: vju-t
+      musl: true
