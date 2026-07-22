@@ -16,6 +16,7 @@ jobs:
     with:
       binary_name: vju-t
       artifact_name: vju-t
+      musl: true
 
   build-freebsd:
     uses: bbusse/github-workflows/.github/workflows/build-rust-pkg-freebsd.yml@dev
@@ -35,4 +36,17 @@ jobs:
       artifact_name: vju-t
       binary_name: vju-t
       release_branch: dev
+    secrets: inherit
+
+  build-apk:
+    needs:
+      - build-macos-arm64
+      - release
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: bbusse/github-workflows/.github/workflows/build-apk.yml@dev
+    with:
+      artifact_name: vju-t
+      binary_name: vju-t
+      version: ${{ needs.release.outputs.version }}
+      pkgurl: https://github.com/bbusse/vju-t
     secrets: inherit
