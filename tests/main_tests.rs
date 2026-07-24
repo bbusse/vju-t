@@ -6,14 +6,11 @@ include!("../src/main.rs");
 mod tests {
     use super::{
         apply_append_text, display_lines_for_run, is_exit_key, parse_bar_values, parse_cli_args,
-        push_output_line, shell_escape_arg, spawn_script, split_args_on_separator,
+        parse_status_value, push_output_line, shell_escape_arg, spawn_script,
+        split_args_on_separator, strip_ansi,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
-    use std::sync::{
-        Arc, Mutex,
-        atomic::AtomicU64,
-        mpsc,
-    };
+    use std::sync::{atomic::AtomicU64, mpsc, Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -35,18 +32,12 @@ mod tests {
             shell_escape_arg("sum:metric.name{env:prod}.as_count()"),
             "'sum:metric.name{env:prod}.as_count()'"
         );
-        assert_eq!(
-            shell_escape_arg("two words"),
-            "'two words'"
-        );
+        assert_eq!(shell_escape_arg("two words"), "'two words'");
     }
 
     #[test]
     fn escapes_single_quote_inside_argument() {
-        assert_eq!(
-            shell_escape_arg("it's good"),
-            "'it'\\''s good'"
-        );
+        assert_eq!(shell_escape_arg("it's good"), "'it'\\''s good'");
     }
 
     #[test]
@@ -66,7 +57,9 @@ mod tests {
             done_tx,
         );
 
-        let finished = done_rx.recv_timeout(Duration::from_secs(5)).expect("script should finish");
+        let finished = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("script should finish");
         assert_eq!(finished, 1);
 
         let lines: Vec<String> = buffer
@@ -129,13 +122,13 @@ mod tests {
     fn no_waiting_flash_while_new_run_has_no_output_yet() {
         // Run 1 produced output; run 2 just started and has nothing yet.
         // display_lines_for_run should return run 1's lines so we don't flash "Waiting...".
-        let buf = vec![
-            (1u64, "line-a".to_string()),
-            (1u64, "line-b".to_string()),
-        ];
+        let buf = vec![(1u64, "line-a".to_string()), (1u64, "line-b".to_string())];
         let lines = display_lines_for_run(&buf, 2);
-        assert_eq!(lines, vec!["line-a", "line-b"],
-            "should fall back to previous run's lines while new run is empty");
+        assert_eq!(
+            lines,
+            vec!["line-a", "line-b"],
+            "should fall back to previous run's lines while new run is empty"
+        );
     }
 
     #[test]
@@ -146,8 +139,11 @@ mod tests {
             (2u64, "new-line".to_string()),
         ];
         let lines = display_lines_for_run(&buf, 2);
-        assert_eq!(lines, vec!["new-line"],
-            "once new run has data, old run lines should not appear");
+        assert_eq!(
+            lines,
+            vec!["new-line"],
+            "once new run has data, old run lines should not appear"
+        );
     }
 
     #[test]
@@ -163,11 +159,14 @@ mod tests {
         // When no word label precedes the value, the value itself becomes the x-axis label.
         let input = "10\n20\n30\n";
         let bars = parse_bar_values(input).expect("should parse multi-line bar values");
-        assert_eq!(bars, vec![
-            ("10".to_string(), 10),
-            ("20".to_string(), 20),
-            ("30".to_string(), 30),
-        ]);
+        assert_eq!(
+            bars,
+            vec![
+                ("10".to_string(), 10),
+                ("20".to_string(), 20),
+                ("30".to_string(), 30),
+            ]
+        );
     }
 
     #[test]
@@ -177,11 +176,14 @@ mod tests {
         // rather than showing a meaningless count (1, 2, 3...).
         let input = "1432\n23\n105\n";
         let bars = parse_bar_values(input).expect("should parse bare numbers");
-        assert_eq!(bars, vec![
-            ("1432".to_string(), 1432),
-            ("23".to_string(), 23),
-            ("105".to_string(), 105),
-        ]);
+        assert_eq!(
+            bars,
+            vec![
+                ("1432".to_string(), 1432),
+                ("23".to_string(), 23),
+                ("105".to_string(), 105),
+            ]
+        );
     }
 
     #[test]
@@ -189,11 +191,14 @@ mod tests {
         // Regression: labeled pairs from later lines must not be dropped.
         let input = "ok 7\nwarn 4\ncrit 2\n";
         let bars = parse_bar_values(input).expect("should parse labeled multi-line values");
-        assert_eq!(bars, vec![
-            ("ok".to_string(), 7),
-            ("warn".to_string(), 4),
-            ("crit".to_string(), 2),
-        ]);
+        assert_eq!(
+            bars,
+            vec![
+                ("ok".to_string(), 7),
+                ("warn".to_string(), 4),
+                ("crit".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
@@ -201,18 +206,14 @@ mod tests {
         // Regression: labels like "2xx:" should remain readable x labels.
         let input = "2xx: 10\n5xx: 3\n";
         let bars = parse_bar_values(input).expect("should parse punctuated labels");
-        assert_eq!(bars, vec![
-            ("2xx".to_string(), 10),
-            ("5xx".to_string(), 3),
-        ]);
+        assert_eq!(bars, vec![("2xx".to_string(), 10), ("5xx".to_string(), 3),]);
     }
 
     #[test]
     fn push_output_line_evicts_old_run_on_first_new_line() {
         // Previous run left lines; first push of new run should clear them.
-        let buffer: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(vec![
-            (1u64, "old".to_string()),
-        ]));
+        let buffer: Arc<Mutex<Vec<(u64, String)>>> =
+            Arc::new(Mutex::new(vec![(1u64, "old".to_string())]));
         let active_run = Arc::new(AtomicU64::new(2));
         let (tx, _rx) = mpsc::channel::<()>();
 
@@ -221,7 +222,10 @@ mod tests {
         let buf = buffer.lock().unwrap();
         let run1: Vec<_> = buf.iter().filter(|(rid, _)| *rid == 1).collect();
         let run2: Vec<_> = buf.iter().filter(|(rid, _)| *rid == 2).collect();
-        assert!(run1.is_empty(), "old run lines should be evicted after first new-run push");
+        assert!(
+            run1.is_empty(),
+            "old run lines should be evicted after first new-run push"
+        );
         assert_eq!(run2.len(), 1);
         assert_eq!(run2[0].1, "new");
     }
@@ -229,9 +233,8 @@ mod tests {
     #[test]
     fn push_output_line_does_not_evict_on_subsequent_lines() {
         // Second push of same run should not clear existing run lines.
-        let buffer: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(vec![
-            (2u64, "first".to_string()),
-        ]));
+        let buffer: Arc<Mutex<Vec<(u64, String)>>> =
+            Arc::new(Mutex::new(vec![(2u64, "first".to_string())]));
         let active_run = Arc::new(AtomicU64::new(2));
         let (tx, _rx) = mpsc::channel::<()>();
 
@@ -251,8 +254,96 @@ mod tests {
 
         push_output_line("stale", &buffer, &active_run, 2, &tx);
 
-        assert!(buffer.lock().unwrap().is_empty(),
-            "stale run output should be dropped silently");
+        assert!(
+            buffer.lock().unwrap().is_empty(),
+            "stale run output should be dropped silently"
+        );
+    }
+
+    // -- status parsing tests -----------------------------------------------
+
+    #[test]
+    fn parse_status_value_reads_single_value() {
+        assert_eq!(parse_status_value("0"), Some(0));
+        assert_eq!(parse_status_value("1"), Some(1));
+    }
+
+    #[test]
+    fn parse_status_value_uses_last_non_empty_line_only() {
+        // Regression: earlier code took the last numeric token found
+        // *anywhere* in the output, so digits on earlier lines (leaked
+        // escape-sequence fragments, pod names, timestamps) could silently
+        // override the real status. Only the final line should count.
+        let text = "RemoteHost=host123\npod-7f9d8c-42\n0";
+        assert_eq!(parse_status_value(text), Some(0));
+    }
+
+    #[test]
+    fn parse_status_value_ignores_trailing_blank_lines() {
+        assert_eq!(parse_status_value("1\n\n\n"), Some(1));
+    }
+
+    #[test]
+    fn parse_status_value_no_digits_returns_none() {
+        assert_eq!(parse_status_value("no status here"), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences() {
+        // Sanity check locking in strip_ansi's existing (unchanged) behavior,
+        // since read_stream_chunks now relies on a sibling helper for the
+        // same CSI/OSC grammar.
+        let input = "\x1b[31mred\x1b[0m\x1b]0;title\x077\x1b]1337;RemoteHost=host\x1b\\ok";
+        assert_eq!(strip_ansi(input), "red7ok");
+    }
+
+    #[test]
+    fn read_stream_chunks_does_not_leak_digits_from_split_osc_sequence() {
+        // Regression: this is the actual reported bug. `zsh -i` (sourcing
+        // .zshrc) can inject an OSC 1337 iTerm2 shell-integration sequence
+        // into stdout when it redraws the prompt right after a command
+        // finishes, e.g. `ESC ] 1337 ; X <CR> host99 BEL` (the embedded \r is
+        // typical of prompt-redraw sequences). The old byte-level splitter
+        // treated that \r as a line break, splitting the sequence into two
+        // fragments: the first (unterminated) OSC start is correctly
+        // swallowed as incomplete, but the second fragment ("host99" + BEL)
+        // no longer starts with ESC, so it isn't recognized as escape-sequence
+        // content at all and leaks straight into the buffer as if it were
+        // real output — its digits then override the real "0" status that
+        // was printed just before it.
+        let buffer: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let active_run = Arc::new(AtomicU64::new(1));
+        let (update_tx, _update_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<u64>();
+
+        let payload = "printf '0\\n\\033]1337;X\\rhost99\\a'";
+        let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), payload.to_string()];
+
+        spawn_script(
+            &cmd,
+            Arc::clone(&buffer),
+            Arc::clone(&active_run),
+            1,
+            update_tx,
+            done_tx,
+        );
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("script should finish");
+
+        let lines = display_lines_for_run(&buffer.lock().unwrap(), 1);
+        let text: String = lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            parse_status_value(&text),
+            Some(0),
+            "status should be the real 0, not corrupted by a split escape sequence (got text: {text:?})"
+        );
     }
 
     // -- append-text tests -------------------------------------------------
@@ -260,7 +351,10 @@ mod tests {
     #[test]
     fn append_text_adds_suffix() {
         let lines = vec!["0.42".to_string()];
-        assert_eq!(apply_append_text(&lines, Some("s")), Some("0.42s".to_string()));
+        assert_eq!(
+            apply_append_text(&lines, Some("s")),
+            Some("0.42s".to_string())
+        );
     }
 
     #[test]
@@ -271,19 +365,21 @@ mod tests {
 
     #[test]
     fn append_text_uses_last_non_empty_line() {
-        let lines = vec![
-            "ignored".to_string(),
-            "42".to_string(),
-            "".to_string(),
-        ];
-        assert_eq!(apply_append_text(&lines, Some("ms")), Some("42ms".to_string()));
+        let lines = vec!["ignored".to_string(), "42".to_string(), "".to_string()];
+        assert_eq!(
+            apply_append_text(&lines, Some("ms")),
+            Some("42ms".to_string())
+        );
     }
 
     #[test]
     fn append_text_strips_ansi_before_appending() {
         // ANSI cyan colour code around the value.
         let lines = vec!["\x1b[36m9.9\x1b[0m".to_string()];
-        assert_eq!(apply_append_text(&lines, Some("s")), Some("9.9s".to_string()));
+        assert_eq!(
+            apply_append_text(&lines, Some("s")),
+            Some("9.9s".to_string())
+        );
     }
 
     #[test]
@@ -300,8 +396,10 @@ mod tests {
     // -- CLI parsing tests -------------------------------------------------
 
     fn argv(args: &[&str]) -> Vec<String> {
-        std::iter::once("vju-t").chain(args.iter().copied())
-            .map(str::to_string).collect()
+        std::iter::once("vju-t")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
     }
 
     #[cfg(unix)]
@@ -373,7 +471,10 @@ mod tests {
         // Regression: `echo data | vju-t --line-chart` — stdin is a pipe, not a TTY.
         // Without crossterm use-dev-tty, keyboard events were silently lost.
         let status = run_pty_exit_test_stdin_pipe("10\\n20\\n30\\n", "sleep 0.8; printf 'q'");
-        assert!(status.success(), "q should exit vju-t even when stdin is a pipe (status: {status:?})");
+        assert!(
+            status.success(),
+            "q should exit vju-t even when stdin is a pipe (status: {status:?})"
+        );
     }
 
     #[cfg(unix)]
@@ -381,7 +482,10 @@ mod tests {
     fn ctrl_c_exits_when_stdin_is_pipe() {
         // Regression: `echo data | vju-t --line-chart` — Ctrl+C should exit even with piped stdin.
         let status = run_pty_exit_test_stdin_pipe("10\\n20\\n30\\n", "sleep 0.8; printf '\\003'");
-        assert!(status.success(), "Ctrl+C should exit vju-t even when stdin is a pipe (status: {status:?})");
+        assert!(
+            status.success(),
+            "Ctrl+C should exit vju-t even when stdin is a pipe (status: {status:?})"
+        );
     }
 
     #[cfg(unix)]
@@ -397,7 +501,10 @@ mod tests {
     fn ctrl_c_key_exits_process_end_to_end() {
         // Regression: Ctrl+C key event in raw mode should terminate the process.
         let status = run_pty_exit_test("sleep 0.6; printf '\\003'");
-        assert!(status.success(), "Ctrl+C should exit vju-t (status: {status:?})");
+        assert!(
+            status.success(),
+            "Ctrl+C should exit vju-t (status: {status:?})"
+        );
     }
 
     #[cfg(unix)]
@@ -406,7 +513,10 @@ mod tests {
         // Regression: child command must not steal stdin from vju-t.
         // `cat` continuously reads stdin; pressing q should still exit vju-t.
         let status = run_pty_exit_test_with_child("sleep 0.6; printf 'q'", "cat");
-        assert!(status.success(), "q should exit even when child reads stdin (status: {status:?})");
+        assert!(
+            status.success(),
+            "q should exit even when child reads stdin (status: {status:?})"
+        );
     }
 
     #[test]
@@ -437,7 +547,10 @@ mod tests {
     #[test]
     fn parse_status_rect_with_text_flag() {
         let cli = parse_cli_args(&argv(&["--status-rect-with-text", "mycmd"]));
-        assert!(matches!(cli.render_mode, super::RenderMode::StatusRectWithText));
+        assert!(matches!(
+            cli.render_mode,
+            super::RenderMode::StatusRectWithText
+        ));
     }
 
     #[test]
@@ -449,36 +562,60 @@ mod tests {
     #[test]
     fn parse_status_good_colour_flag() {
         let cli = parse_cli_args(&argv(&["--status-colour-good", "#00a3e0", "mycmd"]));
-        assert_eq!(cli.status_good_colour, ratatui::style::Color::Rgb(0, 163, 224));
+        assert_eq!(
+            cli.status_good_colour,
+            ratatui::style::Color::Rgb(0, 163, 224)
+        );
     }
 
     #[test]
     fn parse_status_bad_colour_equals_flag() {
         let cli = parse_cli_args(&argv(&["--status-colour-bad=#e0465a", "mycmd"]));
-        assert_eq!(cli.status_bad_colour, ratatui::style::Color::Rgb(224, 70, 90));
+        assert_eq!(
+            cli.status_bad_colour,
+            ratatui::style::Color::Rgb(224, 70, 90)
+        );
     }
 
     #[test]
     fn parse_status_good_colour_rgb_flag() {
         let cli = parse_cli_args(&argv(&["--status-colour-good", "0,163,224", "mycmd"]));
-        assert_eq!(cli.status_good_colour, ratatui::style::Color::Rgb(0, 163, 224));
+        assert_eq!(
+            cli.status_good_colour,
+            ratatui::style::Color::Rgb(0, 163, 224)
+        );
     }
 
     #[test]
     fn parse_status_bad_colour_rgb_equals_flag() {
         let cli = parse_cli_args(&argv(&["--status-colour-bad=224,70,90", "mycmd"]));
-        assert_eq!(cli.status_bad_colour, ratatui::style::Color::Rgb(224, 70, 90));
+        assert_eq!(
+            cli.status_bad_colour,
+            ratatui::style::Color::Rgb(224, 70, 90)
+        );
     }
 
     #[test]
     fn parse_append_text_not_consumed_as_script_arg() {
         // Regression: if --append-text parser arm is deleted, the flag and
         // value would end up in script_args instead of being parsed.
-        let cli = parse_cli_args(&argv(&["--big-text", "--append-text", "s", "mycmd", "arg1"]));
-        assert_eq!(cli.append_text, Some("s".to_string()),
-            "--append-text should be parsed, not in script_args");
-        assert_eq!(cli.script_args, vec!["mycmd", "arg1"],
-            "--append-text should not end up in script_args");
+        let cli = parse_cli_args(&argv(&[
+            "--big-text",
+            "--append-text",
+            "s",
+            "mycmd",
+            "arg1",
+        ]));
+        assert_eq!(
+            cli.append_text,
+            Some("s".to_string()),
+            "--append-text should be parsed, not in script_args"
+        );
+        assert_eq!(
+            cli.script_args,
+            vec!["mycmd", "arg1"],
+            "--append-text should not end up in script_args"
+        );
     }
 
     #[test]
@@ -491,10 +628,20 @@ mod tests {
     #[test]
     fn parse_append_text_with_separator() {
         // Test that --append-text works correctly with -- separator
-        let cli = parse_cli_args(&argv(&["--big-text", "--append-text", "s", "--", "mycmd", "--some-flag"]));
+        let cli = parse_cli_args(&argv(&[
+            "--big-text",
+            "--append-text",
+            "s",
+            "--",
+            "mycmd",
+            "--some-flag",
+        ]));
         assert_eq!(cli.append_text, Some("s".to_string()));
-        assert_eq!(cli.script_args, vec!["mycmd", "--some-flag"],
-            "command args after -- should not be confused with vju-t options");
+        assert_eq!(
+            cli.script_args,
+            vec!["mycmd", "--some-flag"],
+            "command args after -- should not be confused with vju-t options"
+        );
     }
 
     #[test]
@@ -511,15 +658,15 @@ mod tests {
         let raw_lines = vec!["0.42".to_string()];
 
         // This is the exact call Big render makes:
-        let display_str = apply_append_text(
-            &raw_lines,
-            cli.append_text.as_deref(),
-        ).unwrap_or_default();
+        let display_str =
+            apply_append_text(&raw_lines, cli.append_text.as_deref()).unwrap_or_default();
 
         // Verify the output actually contains the appended text
-        assert_eq!(display_str, "0.42s",
+        assert_eq!(
+            display_str, "0.42s",
             "Big render output should contain appended text. \
-             If this test fails, Big render is not calling apply_append_text correctly");
+             If this test fails, Big render is not calling apply_append_text correctly"
+        );
     }
 
     #[test]
@@ -529,34 +676,40 @@ mod tests {
         assert_eq!(cli.append_text, None);
 
         let raw_lines = vec!["0.42".to_string()];
-        let display_str = apply_append_text(
-            &raw_lines,
-            cli.append_text.as_deref(),
-        ).unwrap_or_default();
+        let display_str =
+            apply_append_text(&raw_lines, cli.append_text.as_deref()).unwrap_or_default();
 
-        assert_eq!(display_str, "0.42",
-            "Without --append-text, output should be unchanged");
+        assert_eq!(
+            display_str, "0.42",
+            "Without --append-text, output should be unchanged"
+        );
     }
 
     #[test]
     fn stdin_mode_with_append_text() {
         // Regression: stdin mode (no command) + --append-text should work
         let cli = parse_cli_args(&argv(&["--big-text", "--append-text", "ms"]));
-        assert_eq!(cli.script_args, Vec::<String>::new(),
-            "stdin mode: no script args");
-        assert_eq!(cli.append_text, Some("ms".to_string()),
-            "append_text should be parsed even in stdin mode");
+        assert_eq!(
+            cli.script_args,
+            Vec::<String>::new(),
+            "stdin mode: no script args"
+        );
+        assert_eq!(
+            cli.append_text,
+            Some("ms".to_string()),
+            "append_text should be parsed even in stdin mode"
+        );
         assert!(matches!(cli.render_mode, super::RenderMode::Big));
 
         // Simulate rendering with stdin data
         let raw_lines = vec!["250".to_string()];
-        let display_str = apply_append_text(
-            &raw_lines,
-            cli.append_text.as_deref(),
-        ).unwrap_or_default();
+        let display_str =
+            apply_append_text(&raw_lines, cli.append_text.as_deref()).unwrap_or_default();
 
-        assert_eq!(display_str, "250ms",
-            "stdin + --append-text should produce '250ms'");
+        assert_eq!(
+            display_str, "250ms",
+            "stdin + --append-text should produce '250ms'"
+        );
     }
 
     #[test]
@@ -565,18 +718,19 @@ mod tests {
         let cli = parse_cli_args(&argv(&["--big-text", "--append-text", "s"]));
 
         // Simulate buffer as if stdin had read "0.42\n" once
-        let buffer: Vec<(u64, String)> = vec![
-            (1, "0.42".to_string()),
-        ];
+        let buffer: Vec<(u64, String)> = vec![(1, "0.42".to_string())];
 
         // What display_lines_for_run returns for run 1
         let raw_lines = display_lines_for_run(&buffer, 1);
-        assert_eq!(raw_lines, vec!["0.42"],
-            "display_lines_for_run should return buffer lines for current run");
+        assert_eq!(
+            raw_lines,
+            vec!["0.42"],
+            "display_lines_for_run should return buffer lines for current run"
+        );
 
         // What Big render does with those lines
-        let display_str = apply_append_text(&raw_lines, cli.append_text.as_deref())
-            .unwrap_or_default();
+        let display_str =
+            apply_append_text(&raw_lines, cli.append_text.as_deref()).unwrap_or_default();
         assert_eq!(display_str, "0.42s",
             "Full pipeline: buffer[1] -> display_lines_for_run -> apply_append_text should produce '0.42s'");
     }
@@ -587,9 +741,11 @@ mod tests {
         // If it returns None, unwrap_or_default() produces empty string, silently losing the text.
         let lines = vec!["0.42".to_string()];
         let result = apply_append_text(&lines, Some("s"));
-        assert!(result.is_some(),
+        assert!(
+            result.is_some(),
             "apply_append_text must return Some(), not None, when lines exist. \
-             If None is returned, Big render will display nothing");
+             If None is returned, Big render will display nothing"
+        );
         assert_eq!(result.unwrap(), "0.42s");
     }
 
@@ -599,27 +755,50 @@ mod tests {
         let args = vec![
             "vju-t",
             "--big-text",
-            "--append-text", "s",
-            "--title", "MD GET",
+            "--append-text",
+            "s",
+            "--title",
+            "MD GET",
             "--watch",
             "--",
             "python3",
             "/usr/local/src/pyqdd/query_metric.py",
             "--query",
             "p99:my.orderbird.responsetime",
-        ].into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
 
         let cli = parse_cli_args(&args);
-        assert_eq!(cli.append_text, Some("s".to_string()),
-            "ob-server real command: --append-text 's' should be parsed");
-        assert_eq!(cli.title_override, Some("MD GET".to_string()),
-            "ob-server real command: --title should be parsed");
-        assert!(cli.watch_ms.is_some(),
-            "ob-server real command: --watch should be parsed");
-        assert!(matches!(cli.render_mode, super::RenderMode::Big),
-            "ob-server real command: --big-text should be parsed");
-        assert_eq!(cli.script_args, vec!["python3", "/usr/local/src/pyqdd/query_metric.py", "--query", "p99:my.orderbird.responsetime"],
-            "ob-server real command: args after -- must include --query flag and value");
+        assert_eq!(
+            cli.append_text,
+            Some("s".to_string()),
+            "ob-server real command: --append-text 's' should be parsed"
+        );
+        assert_eq!(
+            cli.title_override,
+            Some("MD GET".to_string()),
+            "ob-server real command: --title should be parsed"
+        );
+        assert!(
+            cli.watch_ms.is_some(),
+            "ob-server real command: --watch should be parsed"
+        );
+        assert!(
+            matches!(cli.render_mode, super::RenderMode::Big),
+            "ob-server real command: --big-text should be parsed"
+        );
+        assert_eq!(
+            cli.script_args,
+            vec![
+                "python3",
+                "/usr/local/src/pyqdd/query_metric.py",
+                "--query",
+                "p99:my.orderbird.responsetime"
+            ],
+            "ob-server real command: args after -- must include --query flag and value"
+        );
     }
 
     #[test]
@@ -627,29 +806,45 @@ mod tests {
         // Regression: --append-text must be preserved after parsing.
         // The variable 'append_text' is set in main() from cli.append_text
         // and must remain in scope for the entire watch loop.
-        let cli = parse_cli_args(&argv(&["--big-text", "--append-text", "s", "--watch", "100ms", "mycmd"]));
+        let cli = parse_cli_args(&argv(&[
+            "--big-text",
+            "--append-text",
+            "s",
+            "--watch",
+            "100ms",
+            "mycmd",
+        ]));
 
         // Verify parsing extracted it correctly
-        assert_eq!(cli.append_text, Some("s".to_string()),
-            "Step 1: --append-text 's' must be parsed from CLI args");
+        assert_eq!(
+            cli.append_text,
+            Some("s".to_string()),
+            "Step 1: --append-text 's' must be parsed from CLI args"
+        );
 
         // Simulate main() doing: let append_text = cli.append_text;
         let append_text = cli.append_text;
-        assert_eq!(append_text, Some("s".to_string()),
-            "Step 2: main() assigns cli.append_text to local variable 'append_text'");
+        assert_eq!(
+            append_text,
+            Some("s".to_string()),
+            "Step 2: main() assigns cli.append_text to local variable 'append_text'"
+        );
 
         // Simulate rendering loop: append_text.as_deref() is passed to apply_append_text
         let raw_lines = vec!["100.5".to_string()];
-        let display_str = apply_append_text(&raw_lines, append_text.as_deref())
-            .unwrap_or_default();
-        assert_eq!(display_str, "100.5s",
-            "Step 3: render loop passes append_text to apply_append_text() and gets '100.5s'");
+        let display_str = apply_append_text(&raw_lines, append_text.as_deref()).unwrap_or_default();
+        assert_eq!(
+            display_str, "100.5s",
+            "Step 3: render loop passes append_text to apply_append_text() and gets '100.5s'"
+        );
 
         // After first iteration, watch cycles. The variable append_text should still have the value.
-        let display_str_2 = apply_append_text(&raw_lines, append_text.as_deref())
-            .unwrap_or_default();
-        assert_eq!(display_str_2, "100.5s",
-            "Step 4: after watch cycle, append_text still has value");
+        let display_str_2 =
+            apply_append_text(&raw_lines, append_text.as_deref()).unwrap_or_default();
+        assert_eq!(
+            display_str_2, "100.5s",
+            "Step 4: after watch cycle, append_text still has value"
+        );
     }
 
     #[test]
@@ -662,17 +857,23 @@ mod tests {
 
         let argv = argv(&[
             "--big-text",
-            "--append-text", "s",     // shell stripped the single quotes
-            "--title", "MD",           // 'MD GET' becomes two separate args
-            "GET",                      // this becomes a script arg since --title only takes one arg
+            "--append-text",
+            "s", // shell stripped the single quotes
+            "--title",
+            "MD",  // 'MD GET' becomes two separate args
+            "GET", // this becomes a script arg since --title only takes one arg
             "--watch",
             "--",
-            "python3", "/usr/local/src/pyqdd/query_metric.py"
+            "python3",
+            "/usr/local/src/pyqdd/query_metric.py",
         ]);
 
         let cli = parse_cli_args(&argv);
-        assert_eq!(cli.append_text, Some("s".to_string()),
-            "klue command: --append-text 's' should parse correctly");
+        assert_eq!(
+            cli.append_text,
+            Some("s".to_string()),
+            "klue command: --append-text 's' should parse correctly"
+        );
         // Note: when klue sends --title 'MD GET' through tmux/shell,
         // it becomes two separate tokens. The parser will consume --title MD,
         // leaving GET as the first script arg.

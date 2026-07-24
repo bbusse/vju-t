@@ -2,9 +2,8 @@ use std::{
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     process::{Command, Stdio},
     sync::{
-        mpsc,
-        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -20,8 +19,11 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
+    widgets::{
+        Axis, BarChart, Block, BorderType, Borders, Chart, Dataset, GraphType, Padding, Paragraph,
+        Wrap,
+    },
     Terminal,
-    widgets::{Axis, BarChart, Block, BorderType, Borders, Chart, Dataset, GraphType, Padding, Paragraph, Wrap},
 };
 use tui_big_text::{BigText, PixelSize};
 
@@ -174,6 +176,48 @@ fn line_requests_screen_clear(input: &str) -> bool {
 }
 
 /// Strip every ANSI/VT escape sequence from `input`, returning plain text.
+/// Given `bytes[i] == 0x1B` (ESC) in a byte stream that may still be
+/// growing, find where a CSI (`ESC [`) or OSC (`ESC ]`) sequence starting
+/// there ends. Returns `None` if `bytes` doesn't (yet) contain enough data
+/// to tell — the caller should wait for more bytes before deciding whether
+/// `i` starts a real sequence at all. Unlike `strip_ansi` (which operates on
+/// a complete, static string and has nothing to wait for), this is only
+/// used by the streaming splitter in `read_stream_chunks`.
+fn pending_escape_seq_end(bytes: &[u8], i: usize) -> Option<usize> {
+    if i + 1 >= bytes.len() {
+        return None; // ESC is the last byte read so far; more may follow
+    }
+    match bytes[i + 1] {
+        b'[' => {
+            // CSI sequence: ESC [ ... final-byte (0x40..=0x7E)
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7E).contains(&bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() {
+                Some(j + 1)
+            } else {
+                None
+            }
+        }
+        b']' => {
+            // OSC sequence: ESC ] ... (BEL | ESC \)
+            let mut j = i + 2;
+            while j < bytes.len() {
+                if bytes[j] == 0x07 {
+                    return Some(j + 1);
+                }
+                if bytes[j] == 0x1B && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                    return Some(j + 2);
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => Some(i + 1), // not CSI/OSC; only the ESC byte itself is consumed
+    }
+}
+
 fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -193,8 +237,14 @@ fn strip_ansi(input: &str) -> String {
                 // OSC sequence
                 i += 2;
                 while i < bytes.len() {
-                    if bytes[i] == 0x07 { i += 1; break; }
-                    if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' { i += 2; break; }
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
                     i += 1;
                 }
             } else {
@@ -216,18 +266,15 @@ fn apply_sgr_params(mut style: Style, params: &str) -> Style {
     if params.is_empty() {
         return Style::default();
     }
-    let parts: Vec<u8> = params
-        .split(';')
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let parts: Vec<u8> = params.split(';').filter_map(|s| s.parse().ok()).collect();
     let mut i = 0usize;
     while i < parts.len() {
         match parts[i] {
-            0  => style = Style::default(),
-            1  => style = style.add_modifier(Modifier::BOLD),
-            2  => style = style.add_modifier(Modifier::DIM),
-            3  => style = style.add_modifier(Modifier::ITALIC),
-            4  => style = style.add_modifier(Modifier::UNDERLINED),
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
             22 => style = style.remove_modifier(Modifier::BOLD),
             30 => style = style.fg(Color::Black),
             31 => style = style.fg(Color::Red),
@@ -263,7 +310,7 @@ fn apply_sgr_params(mut style: Style, params: &str) -> Style {
             95 => style = style.fg(Color::LightMagenta),
             96 => style = style.fg(Color::LightCyan),
             97 => style = style.fg(Color::Gray),
-            _  => {}
+            _ => {}
         }
         i += 1;
     }
@@ -329,13 +376,13 @@ fn ansi_to_line(input: &str) -> Line<'static> {
 }
 
 fn format_watch_label(ms: u64) -> String {
-    if ms % 86_400_000 == 0 {
+    if ms.is_multiple_of(86_400_000) {
         format!("{}d", ms / 86_400_000)
-    } else if ms % 3_600_000 == 0 {
+    } else if ms.is_multiple_of(3_600_000) {
         format!("{}h", ms / 3_600_000)
-    } else if ms % 60_000 == 0 {
+    } else if ms.is_multiple_of(60_000) {
         format!("{}m", ms / 60_000)
-    } else if ms % 1000 == 0 {
+    } else if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else {
         format!("{}ms", ms)
@@ -379,18 +426,16 @@ fn parse_colour(s: &str) -> Option<Color> {
 }
 
 fn parse_duration_ms(s: &str) -> Option<u64> {
-    let (num, unit) = if s.ends_with("ms") {
-        (&s[..s.len() - 2], "ms")
-    } else if s.ends_with('s') {
-        (&s[..s.len() - 1], "s")
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], "m")
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], "h")
-    } else if s.ends_with('d') {
-        (&s[..s.len() - 1], "d")
+    let (num, unit) = if let Some(n) = s.strip_suffix("ms") {
+        (n, "ms")
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, "s")
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, "m")
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, "h")
     } else {
-        return None;
+        (s.strip_suffix('d')?, "d")
     };
     let n: u64 = num.parse().ok()?;
     let ms = match unit {
@@ -458,11 +503,14 @@ fn parse_bar_values(output: &str) -> Option<Vec<(String, u64)>> {
             if let Ok(n) = tokens[i].parse::<f64>() {
                 let v = n.max(0.0).round() as u64;
                 let label = if i > 0 {
-                    let prev = tokens[i - 1]
-                        .trim_matches(|c: char| matches!(c, ':' | ',' | ';' | '|' | '(' | ')' | '[' | ']'));
-                    if !prev.is_empty() && prev.chars().all(|c| {
-                        c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '=')
-                    }) {
+                    let prev = tokens[i - 1].trim_matches(|c: char| {
+                        matches!(c, ':' | ',' | ';' | '|' | '(' | ')' | '[' | ']')
+                    });
+                    if !prev.is_empty()
+                        && prev.chars().all(|c| {
+                            c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '=')
+                        })
+                    {
                         prev.to_string()
                     } else {
                         // No word label — use the rounded value so x-axis matches bar heights
@@ -477,30 +525,37 @@ fn parse_bar_values(output: &str) -> Option<Vec<(String, u64)>> {
             i += 1;
         }
     }
-    if bars.is_empty() { None } else { Some(bars) }
+    if bars.is_empty() {
+        None
+    } else {
+        Some(bars)
+    }
 }
 
 fn parse_status_value(output: &str) -> Option<u64> {
-    let mut last_value: Option<u64> = None;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let normalized = trimmed
-            .chars()
-            .map(|c| if c.is_ascii_digit() || c == '-' { c } else { ' ' })
-            .collect::<String>();
+    // Only the last non-empty line counts as the status: scanning every line
+    // for "the last numeric token anywhere" let stray digits on earlier lines
+    // (e.g. leaked escape-sequence fragments, pod names, timestamps) silently
+    // override the real status.
+    let last_line = output.lines().map(str::trim).rfind(|l| !l.is_empty())?;
 
-        for token in normalized.split_whitespace() {
-            if let Ok(n) = token.parse::<u64>() {
-                last_value = Some(n);
+    let normalized = last_line
+        .chars()
+        .map(|c| {
+            if c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                ' '
             }
-        }
-    }
-    last_value
-}
+        })
+        .collect::<String>();
 
+    normalized
+        .split_whitespace()
+        .next_back()?
+        .parse::<u64>()
+        .ok()
+}
 
 fn pie_lines(width: u16, height: u16, values: [f64; 3]) -> Vec<Line<'static>> {
     render_circle(
@@ -591,7 +646,11 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn status_color(status: u64, good: Color, bad: Color) -> Color {
-    if status == 0 { good } else { bad }
+    if status == 0 {
+        good
+    } else {
+        bad
+    }
 }
 
 fn status_text_color(_status: u64, _good: Color, _bad: Color) -> Color {
@@ -599,7 +658,11 @@ fn status_text_color(_status: u64, _good: Color, _bad: Color) -> Color {
 }
 
 fn status_to_circle_values(status: u64) -> [f64; 3] {
-    if status == 0 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 1.0] }
+    if status == 0 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
 }
 
 fn choose_glyph_for_coverage(coverage: f64, thresholds: [f64; 4]) -> &'static str {
@@ -630,7 +693,8 @@ fn choose_color(seg: [usize; 3], good: Color, warn: Color, bad: Color) -> Color 
 /// If the current run has no output yet (new run just launched),
 /// fall back to the previous run's lines to avoid a "Waiting…" flash.
 fn display_lines_for_run(buf: &[(u64, String)], current_run: u64) -> Vec<String> {
-    let current: Vec<String> = buf.iter()
+    let current: Vec<String> = buf
+        .iter()
         .filter(|(rid, _)| *rid == current_run)
         .map(|(_, line)| line.clone())
         .collect();
@@ -645,7 +709,9 @@ fn display_lines_for_run(buf: &[(u64, String)], current_run: u64) -> Vec<String>
 }
 
 fn apply_append_text(lines: &[String], append_text: Option<&str>) -> Option<String> {
-    let value_line = lines.iter().rev()
+    let value_line = lines
+        .iter()
+        .rev()
         .find(|l| !strip_ansi(l).trim().is_empty())
         .cloned()?;
     let trimmed = strip_ansi(&value_line);
@@ -717,7 +783,11 @@ fn render_scaled_icon_lines(mask: &[&str], max_w: u16, max_h: u16) -> Vec<String
         .collect();
 
     let base_h = trimmed_mask.len() as u16;
-    let base_w = trimmed_mask.iter().map(|row| row.chars().count() as u16).max().unwrap_or(1);
+    let base_w = trimmed_mask
+        .iter()
+        .map(|row| row.chars().count() as u16)
+        .max()
+        .unwrap_or(1);
     if base_w == 0 || base_h == 0 {
         return Vec::new();
     }
@@ -752,23 +822,25 @@ fn render_scaled_icon_lines(mask: &[&str], max_w: u16, max_h: u16) -> Vec<String
 /// Each output row represents two input rows using ▀ (upper), ▄ (lower),
 /// █ (both), or ' ' (neither), halving the visual height like PixelSize::HalfHeight.
 fn render_half_height_pass(rows: Vec<String>) -> Vec<String> {
-    let to_cells = |row: &str| -> Vec<bool> {
-        row.chars().map(|c| c != ' ').collect()
-    };
+    let to_cells = |row: &str| -> Vec<bool> { row.chars().map(|c| c != ' ').collect() };
     let mut out = Vec::new();
     let mut i = 0;
     while i < rows.len() {
         let top = to_cells(&rows[i]);
-        let bot = if i + 1 < rows.len() { to_cells(&rows[i + 1]) } else { vec![] };
+        let bot = if i + 1 < rows.len() {
+            to_cells(&rows[i + 1])
+        } else {
+            vec![]
+        };
         let width = top.len().max(bot.len());
         let mut combined = String::new();
         for col in 0..width {
             let t = top.get(col).copied().unwrap_or(false);
             let b = bot.get(col).copied().unwrap_or(false);
             combined.push(match (t, b) {
-                (true,  true)  => '█',
-                (true,  false) => '▀',
-                (false, true)  => '▄',
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
                 (false, false) => ' ',
             });
         }
@@ -830,12 +902,27 @@ fn read_stream_chunks<R: Read>(
 
         pending.extend_from_slice(&chunk[..n]);
 
+        // Split into "lines" on \n/\r, but never inside an escape sequence:
+        // shell-integration hooks (e.g. iTerm2 via `zsh -i`) routinely emit
+        // OSC sequences containing an embedded \r, and splitting through one
+        // leaves two fragments that no longer look like a complete sequence
+        // to push_output_line's ANSI stripping — leaking raw escape bytes
+        // (often digits, e.g. RemoteHost=host) into the parsed status text.
         let mut start = 0usize;
-        for i in 0..pending.len() {
-            if pending[i] == b'\n' || pending[i] == b'\r' {
+        let mut i = 0usize;
+        while i < pending.len() {
+            if pending[i] == 0x1B {
+                match pending_escape_seq_end(&pending, i) {
+                    Some(end) => i = end,
+                    None => break, // sequence incomplete; wait for more data
+                }
+            } else if pending[i] == b'\n' || pending[i] == b'\r' {
                 let line = String::from_utf8_lossy(&pending[start..i]).to_string();
                 push_output_line(&line, &buffer, &active_run, run_id, &update_tx);
-                start = i + 1;
+                i += 1;
+                start = i;
+            } else {
+                i += 1;
             }
         }
 
@@ -893,14 +980,26 @@ fn spawn_script(
         let reader_run_out = Arc::clone(&active_run);
         let reader_tx_out = update_tx.clone();
         let out_handle = thread::spawn(move || {
-            read_stream_chunks(stdout, reader_buffer_out, reader_run_out, run_id, reader_tx_out);
+            read_stream_chunks(
+                stdout,
+                reader_buffer_out,
+                reader_run_out,
+                run_id,
+                reader_tx_out,
+            );
         });
 
         let reader_buffer_err = Arc::clone(&buffer);
         let reader_run_err = Arc::clone(&active_run);
         let reader_tx_err = update_tx.clone();
         let err_handle = thread::spawn(move || {
-            read_stream_chunks(stderr, reader_buffer_err, reader_run_err, run_id, reader_tx_err);
+            read_stream_chunks(
+                stderr,
+                reader_buffer_err,
+                reader_run_err,
+                run_id,
+                reader_tx_err,
+            );
         });
 
         let _ = out_handle.join();
@@ -1115,7 +1214,9 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             _ if args[i].starts_with("--status-rect-with-conditional-command=") => {
                 let value = args[i].split_once('=').map(|(_, v)| v).unwrap_or("");
                 if value.is_empty() {
-                    eprintln!("Error: --status-rect-with-conditional-command requires a non-empty value");
+                    eprintln!(
+                        "Error: --status-rect-with-conditional-command requires a non-empty value"
+                    );
                     std::process::exit(1);
                 }
                 status_rect_conditional_cmd = Some(value.to_string());
@@ -1197,7 +1298,9 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             }
             "--border-colour" => {
                 if i + 1 >= args.len() {
-                    eprintln!("Error: --border-colour requires a value (e.g. #ff0000, cyan, white)");
+                    eprintln!(
+                        "Error: --border-colour requires a value (e.g. #ff0000, cyan, white)"
+                    );
                     std::process::exit(1);
                 }
                 border_colour = match parse_colour(&args[i + 1]) {
@@ -1247,13 +1350,18 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             }
             "--status-colour-good" => {
                 if i + 1 >= args.len() {
-                    eprintln!("Error: --status-colour-good requires a value (e.g. #00a3e0, cyan, green)");
+                    eprintln!(
+                        "Error: --status-colour-good requires a value (e.g. #00a3e0, cyan, green)"
+                    );
                     std::process::exit(1);
                 }
                 status_good_colour = match parse_colour(&args[i + 1]) {
                     Some(c) => c,
                     None => {
-                        eprintln!("Error: invalid --status-colour-good value '{}'", args[i + 1]);
+                        eprintln!(
+                            "Error: invalid --status-colour-good value '{}'",
+                            args[i + 1]
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -1321,7 +1429,9 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("Usage: vju-t [OPTIONS] [--] <command> [arguments...]\n");
                 println!("Options:");
                 println!("  --no-frame                    Disable border frame");
-                println!("  --select                      Enable output line selection in text mode");
+                println!(
+                    "  --select                      Enable output line selection in text mode"
+                );
                 println!("  --big-text                    Render output as large text");
                 println!("  --pie-chart                   Render output as pie chart");
                 println!("  --bar-chart                   Render output as bar chart");
@@ -1330,12 +1440,16 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
                 println!("  --status-rect                 Render status as rectangle");
                 println!("  --status-circle-with-text     Circle with text overlay");
                 println!("  --status-rect-with-text       Rectangle with big-text value");
-                println!("  --status-rect-with-static-text <text>  Rectangle with static text overlay");
+                println!(
+                    "  --status-rect-with-static-text <text>  Rectangle with static text overlay"
+                );
                 println!("  --status-rect-with-static-icon <icon>  Rectangle with built-in static icon (e.g. KEY_ICON)");
                 println!("  --status-rect-with-conditional-command <cmd>  Rectangle: run <cmd> on success and show its output instead of 'OK'");
                 println!("      Tip: use 'zsh -i -c \"shell-fn args\"' to access shell functions");
                 println!("  --append-text <text>          Append suffix after big-text value (e.g. 's', 'ms')");
-                println!("  --watch [<duration>]          Re-run command periodically (default: 60s)");
+                println!(
+                    "  --watch [<duration>]          Re-run command periodically (default: 60s)"
+                );
                 println!("  --title <text>                Set pane title");
                 println!("  --description <text>          Description shown in info overlay (v)");
                 println!("  --border-colour <colour>      Border colour (e.g. #ff0000, cyan)");
@@ -1697,8 +1811,11 @@ fn main() -> anyhow::Result<()> {
                             let max_v = bars_data.iter().map(|(_, v)| *v).max().unwrap_or(1).max(1);
                             let n = bars_data.len() as u16;
                             // Fit all bars into the available width; minimum bar width of 3.
+                            // n == 0 is handled by the outer branch, so the division below
+                            // (guarded by the `if n == 0` check) can't divide by zero.
+                            #[allow(clippy::manual_checked_ops)]
                             let bar_width = if n == 0 { 7 } else {
-                                ((safe.width.saturating_sub(n.saturating_sub(1))) / n).max(3).min(15)
+                                ((safe.width.saturating_sub(n.saturating_sub(1))) / n).clamp(3, 15)
                             };
                             let bar_gap = if bar_width <= 4 { 1 } else { 2 };
 
@@ -2082,110 +2199,115 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Block for up to 500ms when nothing needs drawing; drain all queued events.
-        let _ = event::poll(Duration::from_millis(
-            if needs_redraw { 0 } else { 500 },
-        ));
+        let _ = event::poll(Duration::from_millis(if needs_redraw { 0 } else { 500 }));
         let mut exit_requested = false;
         while let Ok(true) = event::poll(Duration::from_millis(0)) {
             if let Ok(ev) = event::read() {
                 match ev {
-                Event::Key(key) => match key.code {
-                    _ if is_exit_key(key.code, key.modifiers) => {
-                        exit_requested = true;
-                        break;
-                    }
-                    KeyCode::Char('v') => {
-                        show_info = !show_info;
-                        needs_redraw = true;
-                    }
+                    Event::Key(key) => match key.code {
+                        _ if is_exit_key(key.code, key.modifiers) => {
+                            exit_requested = true;
+                            break;
+                        }
+                        KeyCode::Char('v') => {
+                            show_info = !show_info;
+                            needs_redraw = true;
+                        }
 
-                    KeyCode::Up => {
-                        if select_mode && matches!(render_mode, RenderMode::Text) {
-                            let line_count = {
-                                let buf = buffer.lock().unwrap();
-                                let current_run = active_run.load(Ordering::SeqCst);
-                                display_lines_for_run(&buf, current_run).len()
-                            };
-                            if line_count > 0 {
-                                auto_scroll = false;
-                                let next = match selected_index {
-                                    Some(current) => {
-                                        let current = current.min(line_count - 1);
-                                        if current == 0 { line_count - 1 } else { current - 1 }
-                                    }
-                                    None => line_count - 1,
+                        KeyCode::Up => {
+                            if select_mode && matches!(render_mode, RenderMode::Text) {
+                                let line_count = {
+                                    let buf = buffer.lock().unwrap();
+                                    let current_run = active_run.load(Ordering::SeqCst);
+                                    display_lines_for_run(&buf, current_run).len()
                                 };
-                                selected_index = Some(next);
-                                scroll_offset = (next as u16).min(max_scroll);
+                                if line_count > 0 {
+                                    auto_scroll = false;
+                                    let next = match selected_index {
+                                        Some(current) => {
+                                            let current = current.min(line_count - 1);
+                                            if current == 0 {
+                                                line_count - 1
+                                            } else {
+                                                current - 1
+                                            }
+                                        }
+                                        None => line_count - 1,
+                                    };
+                                    selected_index = Some(next);
+                                    scroll_offset = (next as u16).min(max_scroll);
+                                }
+                            } else {
+                                if auto_scroll {
+                                    scroll_offset = max_scroll;
+                                }
+                                auto_scroll = false;
+                                scroll_offset = scroll_offset.saturating_sub(1);
                             }
-                        } else {
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down => {
+                            if select_mode && matches!(render_mode, RenderMode::Text) {
+                                let line_count = {
+                                    let buf = buffer.lock().unwrap();
+                                    let current_run = active_run.load(Ordering::SeqCst);
+                                    display_lines_for_run(&buf, current_run).len()
+                                };
+                                if line_count > 0 {
+                                    auto_scroll = false;
+                                    let next = match selected_index {
+                                        Some(current) => {
+                                            let current = current.min(line_count - 1);
+                                            if current + 1 >= line_count {
+                                                0
+                                            } else {
+                                                current + 1
+                                            }
+                                        }
+                                        None => 0,
+                                    };
+                                    selected_index = Some(next);
+                                    scroll_offset = (next as u16).min(max_scroll);
+                                }
+                            } else {
+                                if auto_scroll {
+                                    scroll_offset = max_scroll;
+                                }
+                                auto_scroll = false;
+                                scroll_offset = scroll_offset.saturating_add(1);
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::PageUp => {
                             if auto_scroll {
                                 scroll_offset = max_scroll;
                             }
                             auto_scroll = false;
-                            scroll_offset = scroll_offset.saturating_sub(1);
+                            scroll_offset = scroll_offset.saturating_sub(10);
+                            needs_redraw = true;
                         }
-                        needs_redraw = true;
-                    }
-                    KeyCode::Down => {
-                        if select_mode && matches!(render_mode, RenderMode::Text) {
-                            let line_count = {
-                                let buf = buffer.lock().unwrap();
-                                let current_run = active_run.load(Ordering::SeqCst);
-                                display_lines_for_run(&buf, current_run).len()
-                            };
-                            if line_count > 0 {
-                                auto_scroll = false;
-                                let next = match selected_index {
-                                    Some(current) => {
-                                        let current = current.min(line_count - 1);
-                                        if current + 1 >= line_count { 0 } else { current + 1 }
-                                    }
-                                    None => 0,
-                                };
-                                selected_index = Some(next);
-                                scroll_offset = (next as u16).min(max_scroll);
-                            }
-                        } else {
+                        KeyCode::PageDown => {
                             if auto_scroll {
                                 scroll_offset = max_scroll;
                             }
                             auto_scroll = false;
-                            scroll_offset = scroll_offset.saturating_add(1);
+                            scroll_offset = scroll_offset.saturating_add(10);
+                            needs_redraw = true;
                         }
-                        needs_redraw = true;
-                    }
-                    KeyCode::PageUp => {
-                        if auto_scroll {
-                            scroll_offset = max_scroll;
-                        }
-                        auto_scroll = false;
-                        scroll_offset = scroll_offset.saturating_sub(10);
-                        needs_redraw = true;
-                    }
-                    KeyCode::PageDown => {
-                        if auto_scroll {
-                            scroll_offset = max_scroll;
-                        }
-                        auto_scroll = false;
-                        scroll_offset = scroll_offset.saturating_add(10);
-                        needs_redraw = true;
-                    }
-                    KeyCode::End => {
-                        auto_scroll = true;
-                        needs_redraw = true;
-                    }
-                    KeyCode::Esc => {
-                        if select_mode && matches!(render_mode, RenderMode::Text) {
-                            selected_index = None;
+                        KeyCode::End => {
                             auto_scroll = true;
                             needs_redraw = true;
                         }
-                    }
+                        KeyCode::Esc => {
+                            if select_mode && matches!(render_mode, RenderMode::Text) {
+                                selected_index = None;
+                                auto_scroll = true;
+                                needs_redraw = true;
+                            }
+                        }
 
-                    // Re-run script on 'r'
-                    KeyCode::Char('r') => {
-                        if !stdin_mode {
+                        // Re-run script on 'r'
+                        KeyCode::Char('r') if !stdin_mode => {
                             buffer.lock().unwrap().clear();
                             let next_run = active_run.fetch_add(1, Ordering::SeqCst) + 1;
                             spawn_script(
@@ -2200,15 +2322,14 @@ fn main() -> anyhow::Result<()> {
                             last_watch_launch = Instant::now();
                             needs_redraw = true;
                         }
-                    }
 
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => {
+                        needs_redraw = true;
+                    }
                     _ => {}
-                },
-                Event::Resize(_, _) => {
-                    needs_redraw = true;
                 }
-                _ => {}
-            }
             }
         }
 
@@ -2231,7 +2352,9 @@ fn main() -> anyhow::Result<()> {
                     let buf = buffer.lock().unwrap();
                     display_lines_for_run(&buf, finished_run)
                 };
-                let last_text = raw.iter().rev()
+                let last_text = raw
+                    .iter()
+                    .rev()
                     .find(|l| !strip_ansi(l).trim().is_empty())
                     .map(|l| strip_ansi(l).trim().to_string())
                     .unwrap_or_default();
@@ -2257,8 +2380,7 @@ fn main() -> anyhow::Result<()> {
                                 let s = strip_ansi(&raw);
                                 s.lines()
                                     .map(str::trim)
-                                    .filter(|l| !l.is_empty())
-                                    .last()
+                                    .rfind(|l| !l.is_empty())
                                     .map(String::from)
                             });
                         *ct.lock().unwrap() = result;
@@ -2271,7 +2393,10 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Some(interval_ms) = watch_ms {
-            if !stdin_mode && running_run.is_none() && last_watch_launch.elapsed() >= Duration::from_millis(interval_ms) {
+            if !stdin_mode
+                && running_run.is_none()
+                && last_watch_launch.elapsed() >= Duration::from_millis(interval_ms)
+            {
                 let next_run = active_run.fetch_add(1, Ordering::SeqCst) + 1;
                 // Clear buffer only once new data starts arriving (in push_output_line)
                 // to avoid flashing "Waiting…" between runs.
